@@ -1,6 +1,8 @@
 # M5StickC plus ESP32 client for Pokit Pro
 Pokit Pro multimeter client on M5StickC plus(ESP-PICO-D4) via BLE, base on Arduino.
 
+![m5sitckc+](https://user-images.githubusercontent.com/5100899/195969355-9be5f762-d895-48cf-a2b4-b946861e2ae3.jpg)
+
 ## Features
 - Display all Pokit Pro's multimeter values, use button A to switch measurement type, with auto range
 - Auto range display
