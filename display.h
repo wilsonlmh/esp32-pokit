@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 
-String get_display_chars(pokit_measurement_value_t v);
+char* construct_display_chars(pokit_measurement_value_t v, char* r);
 void display_init();
 void draw();
 

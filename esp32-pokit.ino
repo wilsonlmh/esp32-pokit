@@ -34,8 +34,14 @@ void setup() {
 void loop() {
   M5.update();
   if (M5.BtnA.wasPressed()) {
-    pokit_current_settings.mode += 1;
-    pokit_current_settings.mode = pokit_current_settings.mode >= 9 ? 1 : pokit_current_settings.mode;
+    pokit_settings_t new_settings = get_pokit_current_settings();
+    new_settings.mode += 1;
+    new_settings.mode = new_settings.mode >= 9 ? 1 : new_settings.mode;
+
+    mutex_lock(pokit_settings_mutex);
+    pokit_current_settings = new_settings;
+    mutex_unlock(pokit_settings_mutex);
+
     update_pokit_settings();
   }
 

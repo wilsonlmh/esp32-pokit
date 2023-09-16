@@ -35,7 +35,12 @@ pokit_settings_t pokit_current_settings = {
   .interval = 200,
 };
 
-String pokit_latest_display_value = "";
+xSemaphoreHandle pokit_connection_mutex = xSemaphoreCreateMutex();
+xSemaphoreHandle pokit_status_mutex = xSemaphoreCreateMutex();
+xSemaphoreHandle pokit_settings_mutex = xSemaphoreCreateMutex();
+xSemaphoreHandle pokit_latest_display_value_mutex = xSemaphoreCreateMutex();
+
+char pokit_latest_display_value[20] = { 0 };
 
 pokit_measurement_value_t parse_pokit(uint8_t* bytes) {
   pokit_measurement_value_t new_measurement;
@@ -46,33 +51,37 @@ pokit_measurement_value_t parse_pokit(uint8_t* bytes) {
 }
 
 void _update_pokit_settings(void* pvParameters) {
-  if (pokit_connected) {
-    switch (pokit_current_status.mode_switch) {
-      case 0:
-        if (pokit_current_settings.mode != mode_dc_voltage && pokit_current_settings.mode != mode_ac_voltage) {
-          pokit_current_settings.mode = mode_dc_voltage;
-        }
-        break;
-      case 1:
-        if (pokit_current_settings.mode < 3) {
-          pokit_current_settings.mode = mode_resistant;
-        }
-        break;
-      case 2:
-        if (pokit_current_settings.mode != mode_dc_current && pokit_current_settings.mode != mode_dc_current) {
-          pokit_current_settings.mode = mode_dc_current;
-        }
-        break;
-    }
-    // Serial.printf("Writing mm_settings, mode=%d, range=%d, update_interval=%d\n", pokit_current_settings.mode, pokit_current_settings.range, pokit_current_settings.interval);
-    pokit_mm_settings_char->writeValue((uint8_t*)&pokit_current_settings, sizeof(pokit_current_settings), true);
-    // Serial.println("Wrtie done");
+  if (!get_pokit_connected()) vTaskDelete(NULL);
+
+  pokit_settings_t new_settings = get_pokit_current_settings();
+  switch (get_pokit_current_status().mode_switch) {
+    case 0:
+      if (new_settings.mode != mode_dc_voltage && new_settings.mode != mode_ac_voltage) {
+        new_settings.mode = mode_dc_voltage;
+      }
+      break;
+    case 1:
+      if (new_settings.mode < 3) {
+        new_settings.mode = mode_dc_current;
+      }
+      break;
+    case 2:
+      if (new_settings.mode != mode_dc_current && new_settings.mode != mode_dc_current) {
+        new_settings.mode = mode_dc_current;
+      }
+      break;
   }
+
+  mutex_lock(pokit_settings_mutex);
+  pokit_current_settings = new_settings;
+  mutex_unlock(pokit_settings_mutex);
+  pokit_mm_settings_char->writeValue((uint8_t*)&new_settings, sizeof(new_settings), true);
+
   vTaskDelete(NULL);
 }
 
 void update_pokit_settings() {
-    xTaskCreate(_update_pokit_settings, "update_pokit_settings", 10000, NULL, 1, NULL);
+  xTaskCreate(_update_pokit_settings, "update_pokit_settings", 10000, NULL, 10, NULL);
 }
 
 class pokit_mm_scan_callback_c : public BLEAdvertisedDeviceCallbacks {
@@ -85,7 +94,10 @@ class pokit_mm_scan_callback_c : public BLEAdvertisedDeviceCallbacks {
       ble_scan->stop();
       if (pokit_device != nullptr) free(pokit_device);
       pokit_device = new BLEAdvertisedDevice(advertisedDevice);
+
+      mutex_lock(pokit_connection_mutex);
       pokit_found = true;
+      mutex_unlock(pokit_connection_mutex);
     }
   }
 };
@@ -96,7 +108,9 @@ class pokit_mm_client_callback_c : public BLEClientCallbacks {
   }
 
   void onDisconnect(BLEClient* pclient) {
+    mutex_lock(pokit_connection_mutex);
     pokit_connected = false;
+    mutex_unlock(pokit_connection_mutex);
     Serial.println("onDisconnect");
   }
 };
@@ -106,127 +120,134 @@ static pokit_mm_scan_callback_c pokit_mm_scan_callback;
 
 void pokit_mm_notify_callback(BLERemoteCharacteristic* ble_char, uint8_t* data, size_t len, bool is_notify) {
   pokit_current_measurement = parse_pokit((uint8_t*)data);
-  pokit_latest_display_value = get_display_chars(pokit_current_measurement);
-  Serial.println(pokit_latest_display_value);
+  mutex_lock(pokit_latest_display_value_mutex);
+  construct_display_chars(pokit_current_measurement, pokit_latest_display_value);
+  mutex_unlock(pokit_latest_display_value_mutex);
 }
 
 void pokit_status_notify_callback(BLERemoteCharacteristic* ble_char, uint8_t* data, size_t len, bool is_notify) {
-  if (len == 8) {  //For pokit pro, len should be 8
-    memcpy((void*)&pokit_current_status, (void*)data, sizeof(pokit_current_status));
-    update_pokit_settings();
-    Serial.printf("pokit_current_status = {\n  status: %d,\n  battery: %f,\n  unknown_1: %d,\n  mode_switch: %d,\n  unknown_2: %d\n}\n", pokit_current_status.status, pokit_current_status.battery, pokit_current_status.unknown_1, pokit_current_status.mode_switch, pokit_current_status.unknown_2);
-    // delay(100);
-  } else {
-    // Serial.printf("pokit_status_notify_callback() len is %d\n", len);
-  }
+  if (len != 8) return;  //For pokit pro, len should be 8
+  mutex_lock(pokit_status_mutex);
+  memcpy((void*)&pokit_current_status, (void*)data, sizeof(pokit_current_status));
+  mutex_unlock(pokit_status_mutex);
+
+  update_pokit_settings();
+  pokit_status_t current = get_pokit_current_status();
+  Serial.printf("pokit_current_status = {\n  status: %d,\n  battery: %f,\n  unknown_1: %d,\n  mode_switch: %d,\n  unknown_2: %d\n}\n", current.status, current.battery, current.unknown_1, current.mode_switch, current.unknown_2);
 }
 
 void connect_pokit(void* parameter) {
   while (1) {
-    if (!pokit_connected && pokit_found) {
-      pokit_found = false;
-      // Serial.println("connect_pokit()");
-      pokit_client = BLEDevice::createClient();
-      pokit_client->setClientCallbacks(&pokit_mm_client_callback);
-      pokit_client->connect(pokit_device);
-      Serial.println("Connected");
-      // Serial.println(pokit_client->toString().c_str());
-
-      //connect to POKIT_STATUS_BLE_SVC, accquire POKIT_STATUS_CHAR, then subscribe to POKIT_STATUS_CHAR
-      pokit_status_svc = pokit_client->getService(POKIT_STATUS_BLE_SVC);
-      if (pokit_status_svc == nullptr) {
-        Serial.println("No POKIT_STATUS_BLE_SVC!");
-        pokit_client->disconnect();
-        continue;
-      }
-      Serial.println("Got POKIT_STATUS_BLE_SVC");
-
-      pokit_status_char = pokit_status_svc->getCharacteristic(POKIT_STATUS_CHAR);
-      if (pokit_status_char == nullptr) {
-        Serial.println("No POKIT_STATUS_CHAR!");
-        pokit_client->disconnect();
-        continue;
-      }
-      Serial.println("Got POKIT_STATUS_CHAR");
-
-      if (pokit_status_char->canNotify()) {
-        pokit_status_char->registerForNotify(pokit_status_notify_callback);
-      } else {
-        pokit_client->disconnect();
-        Serial.println("Can't subscribe to POKIT_STATUS_CHAR!");
-        continue;
-      }
-      Serial.println("Subscribed to POKIT_STATUS_CHAR!");
-
-      //connect to POKIT_MM_BLE_SVC, accquire POKIT_MM_READ_CHAR & POKIT_MM_SETTINGS_CHAR, then subscribe to POKIT_MM_READ_CHAR
-      pokit_mm_svc = pokit_client->getService(POKIT_MM_BLE_SVC);
-      if (pokit_mm_svc == nullptr) {
-        Serial.println("No POKIT_MM_BLE_SVC!");
-        pokit_client->disconnect();
-        continue;
-      }
-      Serial.println("Got POKIT_MM_BLE_SVC");
-
-      pokit_mm_read_char = pokit_mm_svc->getCharacteristic(POKIT_MM_READ_CHAR);
-      if (pokit_mm_read_char == nullptr) {
-        Serial.println("No POKIT_MM_READ_CHAR!");
-        pokit_client->disconnect();
-        continue;
-      }
-      Serial.println("Got POKIT_MM_READ_CHAR");
-
-      pokit_mm_settings_char = pokit_mm_svc->getCharacteristic(POKIT_MM_SETTINGS_CHAR);
-      if (pokit_mm_settings_char == nullptr) {
-        Serial.println("No POKIT_MM_SETTINGS_CHAR!");
-        pokit_client->disconnect();
-        continue;
-      }
-      Serial.println("Got POKIT_MM_SETTINGS_CHAR");
-
-      if (pokit_mm_read_char->canNotify()) {
-        pokit_mm_read_char->registerForNotify(pokit_mm_notify_callback);
-      } else {
-        pokit_client->disconnect();
-        Serial.println("Can't subscribe to POKIT_MM_READ_CHAR!");
-        continue;
-      }
-      Serial.println("Subscribed to POKIT_MM_READ_CHAR!");
-
-      pokit_connected = true;
-      if (pokit_status_char->canRead()) {
-        std::string value = pokit_status_char->readValue();
-        uint8_t* data = (uint8_t*)reinterpret_cast<const uint8_t*>(&value[0]);
-        pokit_status_notify_callback(pokit_status_char, data, value.length(), false);
-      }
-      // update_pokit_settings();
+    mutex_lock(pokit_connection_mutex);
+    if (pokit_connected || !pokit_found) {
+      mutex_unlock(pokit_connection_mutex);
+      delay(1000);
+      continue;
     }
-    delay(100);
+    pokit_found = false;
+    mutex_unlock(pokit_connection_mutex);
+
+    pokit_client = BLEDevice::createClient();
+    pokit_client->setClientCallbacks(&pokit_mm_client_callback);
+    pokit_client->connect(pokit_device);
+    Serial.println("Connected");
+
+    //connect to POKIT_STATUS_BLE_SVC, accquire POKIT_STATUS_CHAR, then subscribe to POKIT_STATUS_CHAR
+    pokit_status_svc = pokit_client->getService(POKIT_STATUS_BLE_SVC);
+    if (pokit_status_svc == nullptr) {
+      Serial.println("No POKIT_STATUS_BLE_SVC!");
+      pokit_client->disconnect();
+      continue;
+    }
+    Serial.println("Got POKIT_STATUS_BLE_SVC");
+
+    pokit_status_char = pokit_status_svc->getCharacteristic(POKIT_STATUS_CHAR);
+    if (pokit_status_char == nullptr) {
+      Serial.println("No POKIT_STATUS_CHAR!");
+      pokit_client->disconnect();
+      continue;
+    }
+    Serial.println("Got POKIT_STATUS_CHAR");
+
+    if (pokit_status_char->canNotify()) {
+      pokit_status_char->registerForNotify(pokit_status_notify_callback);
+    } else {
+      pokit_client->disconnect();
+      Serial.println("Can't subscribe to POKIT_STATUS_CHAR!");
+      continue;
+    }
+    Serial.println("Subscribed to POKIT_STATUS_CHAR!");
+
+    //connect to POKIT_MM_BLE_SVC, accquire POKIT_MM_READ_CHAR & POKIT_MM_SETTINGS_CHAR, then subscribe to POKIT_MM_READ_CHAR
+    pokit_mm_svc = pokit_client->getService(POKIT_MM_BLE_SVC);
+    if (pokit_mm_svc == nullptr) {
+      Serial.println("No POKIT_MM_BLE_SVC!");
+      pokit_client->disconnect();
+      continue;
+    }
+    Serial.println("Got POKIT_MM_BLE_SVC");
+
+    pokit_mm_read_char = pokit_mm_svc->getCharacteristic(POKIT_MM_READ_CHAR);
+    if (pokit_mm_read_char == nullptr) {
+      Serial.println("No POKIT_MM_READ_CHAR!");
+      pokit_client->disconnect();
+      continue;
+    }
+    Serial.println("Got POKIT_MM_READ_CHAR");
+
+    pokit_mm_settings_char = pokit_mm_svc->getCharacteristic(POKIT_MM_SETTINGS_CHAR);
+    if (pokit_mm_settings_char == nullptr) {
+      Serial.println("No POKIT_MM_SETTINGS_CHAR!");
+      pokit_client->disconnect();
+      continue;
+    }
+    Serial.println("Got POKIT_MM_SETTINGS_CHAR");
+
+    if (pokit_mm_read_char->canNotify()) {
+      pokit_mm_read_char->registerForNotify(pokit_mm_notify_callback);
+    } else {
+      pokit_client->disconnect();
+      Serial.println("Can't subscribe to POKIT_MM_READ_CHAR!");
+      continue;
+    }
+    Serial.println("Subscribed to POKIT_MM_READ_CHAR!");
+
+    mutex_lock(pokit_connection_mutex);
+    pokit_connected = true;
+    mutex_unlock(pokit_connection_mutex);
+
+    if (pokit_status_char->canRead()) {
+      std::string value = pokit_status_char->readValue();
+      uint8_t* data = (uint8_t*)reinterpret_cast<const uint8_t*>(&value[0]);
+      pokit_status_notify_callback(pokit_status_char, data, value.length(), false);
+    }
+
+    delay(1000);
   }
 }
 
 void search_pokit(void* parameter) {
   while (1) {
-    if (!pokit_connected && !pokit_found) {
-      ble_scan->setAdvertisedDeviceCallbacks(&pokit_mm_scan_callback);
-      ble_scan->setInterval(1349);
-      ble_scan->setWindow(449);
-      ble_scan->setActiveScan(true);
-      ble_scan->start(5, false);
+    mutex_lock(pokit_connection_mutex);
+    if (pokit_connected || pokit_found) {
+      mutex_unlock(pokit_connection_mutex);
+      delay(5000);
+      continue;
     }
+    mutex_unlock(pokit_connection_mutex);
+
+    ble_scan->setAdvertisedDeviceCallbacks(&pokit_mm_scan_callback);
+    ble_scan->setInterval(1349);
+    ble_scan->setWindow(449);
+    ble_scan->setActiveScan(true);
+    ble_scan->start(5, false);
     delay(5000);
   }
 }
 
-void _init_pokit(void* pvParameters)  {
+void init_pokit() {
   BLEDevice::init("pokit-client");
   ble_scan = BLEDevice::getScan();
-
   xTaskCreate(search_pokit, "search_pokit", 10000, NULL, 10, NULL);
   xTaskCreate(connect_pokit, "connect_pokit", 10000, NULL, 5, NULL);
-  vTaskDelete(NULL);
 }
-
-void init_pokit() {
-  xTaskCreate(_init_pokit, "init_pokit", 20000, NULL, 1, NULL); //use async task to avoid stack not deep enough    
-}
-

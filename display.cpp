@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include "shared.h"
 #include <stdlib.h>
 #include <math.h>
@@ -7,7 +6,10 @@
 #include <M5StickCPlus.h>
 #include "ble_data.h"
 
-#define MAX_DECIMAL_DIGITS 6  //uV, uA, uOhm level
+#define OHM char(233) // Ω
+#define DEG char(247) // °
+
+#define MAX_DECIMAL_DIGITS 4  //uV, uA, uOhm level
 #define PADDING_LEFT 2
 #define PADDING_RIGHT 2
 #define PADDING_TOP 2
@@ -15,7 +17,7 @@
 
 static TFT_eSprite fbuf(&M5.Lcd);  //frame buffer
 
-String get_display_chars(pokit_measurement_value_t v) {
+char* construct_display_chars(pokit_measurement_value_t v, char* r) {
   char unit[3] = { 0 }, new_unit[3] = { 0 };
   float factor = 1.0f;
   uint8_t decimals = MAX_DECIMAL_DIGITS;
@@ -56,31 +58,23 @@ String get_display_chars(pokit_measurement_value_t v) {
       strcpy(unit, new_unit);
       break;
     case mode_resistant:
-      sprintf(new_unit, "%sΩ", unit);
+      sprintf(new_unit, "%s%c", unit, OHM);
       strcpy(unit, new_unit);
       break;
     case mode_diode:
       sprintf(unit, "V");
       break;
     case mode_connectivity:
-      sprintf(unit, "Ω");
+      sprintf(unit, "%c", OHM); 
       break;
     case mode_temperature:
-      sprintf(unit, "°C");
+      sprintf(unit, "%cC", DEG);
       break;
   }
 
-  // String r = String(value, (unsigned int)decimals);
-  // r.concat(" ");
-  // r.concat(unit);
-  // Serial.println(decimals);
-  // Serial.println(unit);
-  // Serial.println(value);
-  char r[20] = { 0 };
+  decimals = decimals > MAX_DECIMAL_DIGITS ? 0 : decimals; //overflow
   sprintf(r, "%.*f %s", decimals, value, unit);
-  // sprintf(r, "%d", 1);
-  String s = String(r);
-  return s;
+  return r;
 }
 
 void display_init() {
@@ -88,7 +82,6 @@ void display_init() {
   fbuf.setRotation(1);
   fbuf.setSwapBytes(true);
   fbuf.createSprite(M5.Lcd.width(), M5.Lcd.height());
-  // Serial.printf("width: %d, height: %d\n", M5.Lcd.width(), M5.Lcd.height());
 }
 
 void draw_battery() {
@@ -104,7 +97,7 @@ void draw_battery() {
 
   fbuf.setTextDatum(BR_DATUM);
   fbuf.setTextColor(((0 >> 3) << 11) | ((0 >> 2) << 5) | ((255 >> 3) << 0), TFT_WHITE);  // #FF6600
-  String pokit_battery = String(pokit_current_status.battery);
+  String pokit_battery = String(get_pokit_current_status().battery);
   pokit_battery.concat("V");
   fbuf.drawString(pokit_battery, (int)(M5.Lcd.width() - PADDING_RIGHT), PADDING_TOP + 0, 1);
 }
@@ -126,18 +119,15 @@ void draw_range() {
   //TODO
 }
 
-
 void draw_value() {
   String next_value;
-  if (!pokit_connected) {
-    if (!pokit_found) {
-      next_value = "Searching...";
-    } else {
-      next_value = "Connecting...";
-    }
-  } else {
-    next_value = pokit_latest_display_value;
-  }
+  mutex_lock(pokit_latest_display_value_mutex);
+  next_value = String(pokit_latest_display_value);
+  mutex_unlock(pokit_latest_display_value_mutex);
+
+  mutex_lock(pokit_connection_mutex);
+  if (!pokit_connected) next_value = pokit_found ? "Connecting..." : "Searching...";
+  mutex_unlock(pokit_connection_mutex);
 
   fbuf.setTextSize(3);
   fbuf.setTextColor(TFT_BLACK, TFT_WHITE);

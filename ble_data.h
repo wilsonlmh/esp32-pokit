@@ -78,4 +78,8 @@ typedef struct {
 #define connectivity_range 255
 #define temperature_range 255;
 
+pokit_status_t get_pokit_current_status();
+pokit_settings_t get_pokit_current_settings();
+bool get_pokit_connected();
+
 #endif
